@@ -1,7 +1,16 @@
 import os
+import csv
+import json
 import copy
+import random
 import hydra
+import numpy as np
 import torch
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from omegaconf import DictConfig, OmegaConf
 import wandb
 from sacrebleu.metrics import CHRF
@@ -13,8 +22,110 @@ from transformers import (
 from utils import (
     grpo_generate_sequences,
     grpo_compute_loss_and_logs,
+    compute_translation_metrics,
+    LMScorer,
 )
 from dl import TranslationDataModule
+
+
+def _set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Best-effort determinism (cuBLAS may still be non-deterministic).
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _append_csv_row(path, row, fieldnames):
+    is_new = not os.path.exists(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _upload_dir_to_s3(local_dir, s3_uri_prefix):
+    """Upload every file under local_dir to s3_uri_prefix preserving structure."""
+    if not os.path.isdir(local_dir):
+        return
+    import boto3
+
+    s3 = boto3.client("s3")
+    assert s3_uri_prefix.startswith("s3://")
+    bucket, _, key_prefix = s3_uri_prefix[len("s3://"):].partition("/")
+    key_prefix = key_prefix.rstrip("/")
+    for root, _, files in os.walk(local_dir):
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            rel = os.path.relpath(local_path, local_dir).replace(os.sep, "/")
+            key = f"{key_prefix}/{rel}" if key_prefix else rel
+            s3.upload_file(local_path, bucket, key)
+            print(f"  uploaded -> s3://{bucket}/{key}")
+
+
+def _upload_file_to_s3(local_path, s3_uri):
+    if not os.path.exists(local_path):
+        return
+    import boto3
+
+    s3 = boto3.client("s3")
+    assert s3_uri.startswith("s3://")
+    bucket, _, key = s3_uri[len("s3://"):].partition("/")
+    s3.upload_file(local_path, bucket, key)
+    print(f"  uploaded -> s3://{bucket}/{key}")
+
+
+def _sync_outputs_to_s3(s3_output_uri, exp_name, summary_json_path,
+                        training_log_path, plots_dir, model_save_dir, upload_model):
+    """Push per-experiment outputs under s3_output_uri/{exp_name}/."""
+    if not s3_output_uri:
+        return
+    base = s3_output_uri.rstrip("/")
+    target = f"{base}/{exp_name}"
+    print(f"Syncing outputs to {target}/ ...")
+    try:
+        _upload_file_to_s3(summary_json_path, f"{target}/results/{exp_name}.json")
+        _upload_file_to_s3(training_log_path, f"{target}/results/training_log_{exp_name}.csv")
+        _upload_dir_to_s3(plots_dir, f"{target}/plots/{exp_name}")
+        if upload_model and model_save_dir:
+            _upload_dir_to_s3(model_save_dir, f"{target}/model")
+        print("S3 sync done.")
+    except Exception as exc:
+        print(f"[warn] S3 sync failed: {exc}")
+
+
+def _save_run_plots(history, plots_dir):
+    """Save reward / chrf / bleu / ter / bertscore vs steps plots from history."""
+    if not history:
+        return
+    os.makedirs(plots_dir, exist_ok=True)
+    steps = [row["step"] for row in history]
+    plot_specs = [
+        ("reward", "reward_vs_steps.png", "Reward"),
+        ("chrf++", "chrf_vs_steps.png", "chrF++"),
+        ("bleu", "bleu_vs_steps.png", "BLEU"),
+        ("ter", "ter_vs_steps.png", "TER"),
+        ("bertscore", "bertscore_vs_steps.png", "BERTScore (F1 x100)"),
+    ]
+    for key, fname, ylabel in plot_specs:
+        ys = [row.get(key) for row in history if row.get(key) is not None]
+        xs = [row["step"] for row in history if row.get(key) is not None]
+        if not ys:
+            continue
+        plt.figure()
+        plt.plot(xs, ys, marker="o")
+        plt.xlabel("Optimizer step")
+        plt.ylabel(ylabel)
+        plt.title(f"{ylabel} vs steps")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, fname))
+        plt.close()
 
 def _run_evaluation(
     model: torch.nn.Module,
@@ -95,11 +206,18 @@ def _run_evaluation(
                     pbar.update(1)
 
     results = {}
-    if predictions and "chrf++" in requested_metrics:
-        chrf_metric = CHRF(word_order=2, char_order=6)
-        # sacrebleu expects references as list of reference sets
-        score = chrf_metric.corpus_score(hypotheses=predictions, references=[references]).score
-        results[f"{metric_prefix}/chrf++"] = float(score)
+    if predictions:
+        compute_bertscore = "bertscore" in requested_metrics or not requested_metrics
+        bertscore_lang = getattr(eval_cfg, "bertscore_lang", "en")
+        # Always compute the full IEEE-paper metric set: BLEU, chrF++, TER, BERTScore.
+        metric_dict = compute_translation_metrics(
+            predictions,
+            references,
+            bertscore_lang=bertscore_lang,
+            compute_bertscore=compute_bertscore,
+        )
+        for k, v in metric_dict.items():
+            results[f"{metric_prefix}/{k}"] = float(v)
 
     if results:
         print(f"{split_name.capitalize()} evaluation results:")
@@ -120,12 +238,52 @@ def _run_evaluation(
     if was_training:
         model.train()
 
-    return results
+    # Strip prefix for ease of consumption by callers
+    flat = {key.split("/", 1)[1]: value for key, value in results.items() if "/" in key}
+    return {
+        "metrics": flat,
+        "predictions": predictions,
+        "references": references,
+        "sources": [r[2] for r in sample_records],
+    }
 
 
 @hydra.main(version_base=None, config_path="./configs/", config_name="train")
 def train(config: DictConfig):
-    torch.manual_seed(config.seed)
+    _set_global_seed(int(config.seed))
+
+    # Experiment mode: baseline_eval | rl_baseline | modified_rl
+    exp_cfg = getattr(config.task, "experiment", None)
+    exp_mode = str(getattr(exp_cfg, "mode", "rl_baseline")).strip() if exp_cfg is not None else "rl_baseline"
+    exp_name = str(getattr(exp_cfg, "name", exp_mode)) if exp_cfg is not None else exp_mode
+    reward_cfg = getattr(exp_cfg, "reward", None) if exp_cfg is not None else None
+    reward_type = str(getattr(reward_cfg, "type", "baseline")) if reward_cfg is not None else "baseline"
+    reward_lambdas = (
+        float(getattr(reward_cfg, "lambda1", 0.7)) if reward_cfg is not None else 0.7,
+        float(getattr(reward_cfg, "lambda2", 0.2)) if reward_cfg is not None else 0.2,
+        float(getattr(reward_cfg, "lambda3", 0.1)) if reward_cfg is not None else 0.1,
+    )
+    lm_model_name = (
+        str(getattr(reward_cfg, "lm_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"))
+        if reward_cfg is not None
+        else "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+    s3_output_uri = str(getattr(exp_cfg, "s3_output_uri", "")) if exp_cfg is not None else ""
+    upload_model_to_s3 = (
+        bool(getattr(exp_cfg, "upload_model_to_s3", False)) if exp_cfg is not None else False
+    )
+
+    if exp_mode == "baseline_eval":
+        force_eval_only = True
+    elif exp_mode == "rl_baseline":
+        force_eval_only = False
+        reward_type = "baseline"
+    elif exp_mode == "modified_rl":
+        force_eval_only = False
+        reward_type = "modified"
+    else:
+        force_eval_only = False  # unknown -> defer to eval.only flag
+
     # Device mapping: policy (NLLB) on cuda:1, reference+goldfish on cuda:0
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         aux_device = torch.device("cuda:0")
@@ -162,6 +320,8 @@ def train(config: DictConfig):
 
     eval_cfg = getattr(config.task, "eval", None)
     eval_only = bool(getattr(eval_cfg, "only", False)) if eval_cfg is not None else False
+    if force_eval_only:
+        eval_only = True
     run_eval = bool(getattr(eval_cfg, "run", False)) if eval_cfg is not None else False
     if eval_only:
         run_eval = True
@@ -215,6 +375,9 @@ def train(config: DictConfig):
         target_lang=config.task.data.target_lang,
         sort_by_length=False,
         train_batch_size=int(getattr(config.task.training, "batch_size", 1)),
+        train_file=getattr(config.task.data, "train_file", None),
+        valid_file=getattr(config.task.data, "valid_file", None),
+        test_file=getattr(config.task.data, "test_file", None),
     )
     data.setup("fit")
     val_dataloader = data.val_dataloader() if run_eval else None
@@ -240,6 +403,22 @@ def train(config: DictConfig):
     tgt_lang_id = tokenizer.convert_tokens_to_ids(target_lang_code)
     src_lang_id = tokenizer.convert_tokens_to_ids(source_lang_code)
 
+    # Lazily-loaded fluency scorer for the modified reward.
+    lm_scorer = None
+    if reward_type == "modified" and run_training:
+        print(f"Loading LM scorer ({lm_model_name}) on {aux_device}...")
+        lm_scorer = LMScorer(model_name=lm_model_name, device=str(aux_device))
+
+    # Output directories per experiment
+    repo_root = hydra.utils.get_original_cwd()
+    results_dir = os.path.join(repo_root, "results")
+    plots_dir = os.path.join(repo_root, "plots", exp_name)
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+    training_log_path = os.path.join(repo_root, "results", f"training_log_{exp_name}.csv")
+    metric_history = []  # list of {"step", "reward", "bleu", "chrf++", "ter", "bertscore"}
+    last_train_reward = float("nan")
+
     # Optimizer setup
     if run_training:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -258,37 +437,48 @@ def train(config: DictConfig):
         accum_steps_since_update = 0
         optimizer_step = 0
         
+    def _evaluate_and_log(split_name, dataloader, cfg, step_idx_local, train_reward=float("nan")):
+        if dataloader is None or cfg is None:
+            return None
+        out = _run_evaluation(
+            model,
+            tokenizer,
+            dataloader,
+            cfg,
+            tgt_lang_id=tgt_lang_id,
+            device=policy_device,
+            max_new_tokens=max_new_tokens,
+            split_name=split_name,
+            step_idx=step_idx_local,
+            total_training_steps=total_training_steps,
+            wandb_run=wandb_run,
+            wandb_table=wandb_table,
+        )
+        if out is None or not out.get("metrics"):
+            return out
+        if split_name == "eval":
+            row = {
+                "step": int(step_idx_local),
+                "reward": float(train_reward),
+                "bleu": float(out["metrics"].get("bleu", 0.0)),
+                "chrf++": float(out["metrics"].get("chrf++", 0.0)),
+                "ter": float(out["metrics"].get("ter", 0.0)),
+                "bertscore": float(out["metrics"].get("bertscore", 0.0)),
+            }
+            metric_history.append(row)
+            _append_csv_row(
+                training_log_path,
+                row,
+                fieldnames=["step", "reward", "bleu", "chrf++", "ter", "bertscore"],
+            )
+        return out
+
+    test_initial_out = None
+    eval_initial_out = None
     if run_test:
-        _run_evaluation(
-            model,
-            tokenizer,
-            test_dataloader,
-            test_eval_cfg,
-            tgt_lang_id=tgt_lang_id,
-            device=policy_device,
-            max_new_tokens=max_new_tokens,
-            split_name="test",
-            step_idx=0,
-            total_training_steps=total_training_steps,
-            wandb_run=wandb_run,
-            wandb_table=wandb_table,
-        )
-        
+        test_initial_out = _evaluate_and_log("test", test_dataloader, test_eval_cfg, 0)
     if run_eval:
-        _run_evaluation(
-            model,
-            tokenizer,
-            val_dataloader,
-            eval_cfg,
-            tgt_lang_id=tgt_lang_id,
-            device=policy_device,
-            max_new_tokens=max_new_tokens,
-            split_name="eval",
-            step_idx=0,
-            total_training_steps=total_training_steps,
-            wandb_run=wandb_run,
-            wandb_table=wandb_table,
-        )
+        eval_initial_out = _evaluate_and_log("eval", val_dataloader, eval_cfg, 0)
 
     if run_training:
         for epoch in range(max_epochs):
@@ -394,6 +584,9 @@ def train(config: DictConfig):
                         beta=beta,
                         clip_param=clip_param,
                         tgt_lang_id=src_lang_id,
+                        reward_type=reward_type,
+                        reward_lambdas=reward_lambdas,
+                        lm_scorer=lm_scorer,
                     )
 
                     loss_scale = 1.0 / float(grad_accum_steps)
@@ -412,26 +605,22 @@ def train(config: DictConfig):
                                 p.requires_grad_(False)
 
                 updates_per_batch += getattr(config.task.training, "updates_per_batch", 50)
+                last_train_reward = float(logs_backward["reward"].item())
                 if run_eval and eval_every_n_opt_steps > 0 and (optimizer_step % eval_every_n_opt_steps == 0):
-                    _run_evaluation(
-                        model,
-                        tokenizer,
+                    _evaluate_and_log(
+                        "eval",
                         val_dataloader,
                         eval_cfg,
-                        tgt_lang_id=tgt_lang_id,
-                        device=policy_device,
-                        max_new_tokens=max_new_tokens,
-                        split_name="eval",
-                        step_idx=step_idx,
-                        total_training_steps=total_training_steps,
-                        wandb_run=wandb_run,
-                        wandb_table=wandb_table,
+                        optimizer_step,
+                        train_reward=last_train_reward,
                     )
 
                 print(
                     f"[epoch {epoch}] step {step_idx} (opt {optimizer_step}) | "
                     f"f_chrf={forward_chrf_mean:.4f} | "
-                    f"b_loss={logs_backward['loss'].item():.4f} b_kl={logs_backward['kl'].item():.4f} b_reward={logs_backward['reward'].item():.4f} b_chrf={logs_backward['chrf'].item():.4f} b_bleu={logs_backward['bleu'].item():.4f}"
+                    f"b_loss={logs_backward['loss'].item():.4f} b_kl={logs_backward['kl'].item():.4f} "
+                    f"b_reward={logs_backward['reward'].item():.4f} b_chrf={logs_backward['chrf'].item():.4f} "
+                    f"b_bleu={logs_backward['bleu'].item():.4f} b_lm={logs_backward['lmscore'].item():.4f}"
                 )
                 # Print the reference and one generated sequence for inspection
                 best_candidates = []
@@ -458,6 +647,7 @@ def train(config: DictConfig):
                             "train/backward_chrf": float(logs_backward["chrf"].item()),
                             "train/backward_reward": float(logs_backward["reward"].item()),
                             "train/backward_bleu": float(logs_backward["bleu"].item()),
+                            "train/backward_lmscore": float(logs_backward["lmscore"].item()),
                         }
                     )
                     # if train_table is not None:
@@ -475,37 +665,67 @@ def train(config: DictConfig):
             model.save_pretrained(epoch_save_dir)
             tokenizer.save_pretrained(epoch_save_dir)
             print(f"Model saved to {epoch_save_dir}")
+    final_eval_out = None
+    final_test_out = None
+    final_step = int(locals().get("optimizer_step", 0))
     if run_eval and not eval_only:
-        _run_evaluation(
-            model,
-            tokenizer,
-            val_dataloader,
-            eval_cfg,
-            tgt_lang_id=tgt_lang_id,
-            device=policy_device,
-            max_new_tokens=max_new_tokens,
-            split_name="eval",
-            step_idx=step_idx,
-            total_training_steps=total_training_steps,
-            wandb_run=wandb_run,
-            wandb_table=wandb_table,
+        final_eval_out = _evaluate_and_log(
+            "eval", val_dataloader, eval_cfg, final_step, train_reward=last_train_reward
         )
-        
+
     if run_test:
-        _run_evaluation(
-            model,
-            tokenizer,
-            test_dataloader,
-            test_eval_cfg,
-            tgt_lang_id=tgt_lang_id,
-            device=policy_device,
-            max_new_tokens=max_new_tokens,
-            split_name="test",
-            step_idx=step_idx,
-            total_training_steps=total_training_steps,
-            wandb_run=wandb_run,
-            wandb_table=wandb_table,
-        )
+        final_test_out = _evaluate_and_log("test", test_dataloader, test_eval_cfg, final_step)
+
+    # Save plots and JSON summary
+    _save_run_plots(metric_history, plots_dir)
+    summary_path = os.path.join(results_dir, f"{exp_name}.json")
+    summary = {
+        "experiment": exp_name,
+        "mode": exp_mode,
+        "reward_type": reward_type,
+        "reward_lambdas": list(reward_lambdas),
+        "source_lang": source_lang_code,
+        "target_lang": target_lang_code,
+        "model": str(getattr(config.task.model, "name", "")),
+        "seed": int(config.seed),
+        "history": metric_history,
+        "final_eval": (final_eval_out or eval_initial_out or {}).get("metrics") if (final_eval_out or eval_initial_out) else None,
+        "final_test": (final_test_out or test_initial_out or {}).get("metrics") if (final_test_out or test_initial_out) else None,
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Saved metrics summary to {summary_path}")
+
+    # CSV summary table (one row per experiment, for paper-friendly tables).
+    csv_summary_path = os.path.join(results_dir, "summary.csv")
+    csv_row = {
+        "experiment": exp_name,
+        "mode": exp_mode,
+        "reward_type": reward_type,
+    }
+    for split_key, payload in (("eval", summary["final_eval"]), ("test", summary["final_test"])):
+        if payload:
+            for m in ("bleu", "chrf++", "ter", "bertscore"):
+                csv_row[f"{split_key}_{m}"] = float(payload.get(m, 0.0))
+    fieldnames = ["experiment", "mode", "reward_type"] + [
+        f"{split}_{m}"
+        for split in ("eval", "test")
+        for m in ("bleu", "chrf++", "ter", "bertscore")
+    ]
+    _append_csv_row(csv_summary_path, csv_row, fieldnames=fieldnames)
+    print(f"Appended CSV summary row to {csv_summary_path}")
+
+    # Optional S3 sync of per-experiment outputs.
+    last_model_dir = locals().get("epoch_save_dir")
+    _sync_outputs_to_s3(
+        s3_output_uri=s3_output_uri,
+        exp_name=exp_name,
+        summary_json_path=summary_path,
+        training_log_path=training_log_path,
+        plots_dir=plots_dir,
+        model_save_dir=last_model_dir,
+        upload_model=upload_model_to_s3,
+    )
 
     if wandb.run is not None:
         wandb.finish()

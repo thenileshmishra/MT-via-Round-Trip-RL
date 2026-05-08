@@ -1,3 +1,4 @@
+import os
 import torch
 from torch.utils.data import DataLoader, Sampler
 from torchdata.datapipes.map import MapDataPipe
@@ -6,6 +7,23 @@ import warnings
 from datasets import load_dataset
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
+
+
+def _load_local_split(path):
+    """Load a local CSV/TSV/JSON(L) file as a HF Dataset split.
+
+    Expected columns: sentence_<source_lang> and sentence_<target_lang>.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        ds = load_dataset("csv", data_files=path)
+    elif ext == ".tsv":
+        ds = load_dataset("csv", data_files=path, delimiter="\t")
+    elif ext in (".json", ".jsonl"):
+        ds = load_dataset("json", data_files=path)
+    else:
+        raise ValueError(f"Unsupported file extension '{ext}' for {path}")
+    return ds["train"]
 
 
 class TranslationDataModule(LightningDataModule):
@@ -20,6 +38,9 @@ class TranslationDataModule(LightningDataModule):
         sort_by_length: bool = True,
         sort_direction: str = "asc",
         train_batch_size: int = 1,
+        train_file: str = None,
+        valid_file: str = None,
+        test_file: str = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore="tokenizer")
@@ -31,46 +52,51 @@ class TranslationDataModule(LightningDataModule):
         self._train_batch_size = max(int(train_batch_size), 1)
 
     def setup(self, stage=None):
-        prompts = load_dataset(
-            self.hparams.data_path, self.hparams.dataset_config_name, trust_remote_code=True
-        )
+        src_col = "sentence_" + self.hparams.source_lang
+        tgt_col = "sentence_" + self.hparams.target_lang
 
-        def _resolve_split(split_names):
-            for split_name in split_names:
-                if split_name in prompts:
-                    return prompts[split_name]
-            return None
+        train_file = self.hparams.train_file
+        valid_file = self.hparams.valid_file
+        test_file = self.hparams.test_file
+        use_local = any(f is not None for f in (train_file, valid_file, test_file))
 
-        train_split = _resolve_split(("train", "training"))
+        if use_local:
+            if train_file is None or valid_file is None:
+                raise ValueError(
+                    "When using local files, at least train_file and valid_file must be provided."
+                )
+            train_split = _load_local_split(train_file)
+            val_split = _load_local_split(valid_file)
+            test_split = _load_local_split(test_file) if test_file is not None else None
+        else:
+            prompts = load_dataset(
+                self.hparams.data_path,
+                self.hparams.dataset_config_name,
+                trust_remote_code=True,
+            )
+
+            def _resolve_split(split_names):
+                for split_name in split_names:
+                    if split_name in prompts:
+                        return prompts[split_name]
+                return None
+
+            train_split = _resolve_split(("train", "training"))
+            val_split = _resolve_split(("valid", "validation", "val"))
+            test_split = _resolve_split(("test", "test_final"))
+
         if train_split is None:
             raise ValueError("Training split not found in dataset.")
-        self.train_data = TranslationDataPipe(
-            train_split,
-            self.tokenizer,
-            src_col="sentence_" + self.hparams.source_lang,
-            tgt_col="sentence_" + self.hparams.target_lang,
-        )
-
-        val_split = _resolve_split(("valid", "validation", "val"))
         if val_split is None:
             raise ValueError("Validation split not found in dataset.")
-        self.val_data = TranslationDataPipe(
-            val_split,
-            self.tokenizer,
-            src_col="sentence_" + self.hparams.source_lang,
-            tgt_col="sentence_" + self.hparams.target_lang,
-        )
 
-        test_split = _resolve_split(("test", "test_final"))
-        if test_split is not None:
-            self.test_data = TranslationDataPipe(
-                test_split,
-                self.tokenizer,
-                src_col="sentence_" + self.hparams.source_lang,
-                tgt_col="sentence_" + self.hparams.target_lang,
-            )
-        else:
-            self.test_data = None
+        self.train_data = TranslationDataPipe(train_split, self.tokenizer, src_col, tgt_col)
+        self.val_data = TranslationDataPipe(val_split, self.tokenizer, src_col, tgt_col)
+        self.test_data = (
+            TranslationDataPipe(test_split, self.tokenizer, src_col, tgt_col)
+            if test_split is not None
+            else None
+        )
 
     def train_dataloader(self):
         if self._train_sampler is not None:

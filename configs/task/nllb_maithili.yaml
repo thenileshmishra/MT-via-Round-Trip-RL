@@ -1,0 +1,74 @@
+name: "nllb-maithili"
+
+data:
+  path: "breakend/nllb-multi-domain"
+  source_lang: eng_Latn
+  target_lang: mai_Deva
+  dataset_config_name: "eng_Latn-mai_Deva"
+  # Set these to point to local CSV/TSV/JSONL files with columns
+  # `sentence_eng_Latn` and `sentence_mai_Deva`. Leaving them null
+  # falls back to the HF dataset specified above.
+  train_file: null
+  valid_file: null
+  test_file: null
+
+model:
+  name: "facebook/nllb-200-distilled-600M"
+  use_lora: false
+  lora:
+    r: 8
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+
+experiment:
+  # mode: baseline_eval | rl_baseline | modified_rl
+  mode: rl_baseline
+  name: rl_baseline_maithili
+  reward:
+    # type: baseline (chrF++ + BLEU) | modified (lambda1*chrF++ + lambda2*BLEU + lambda3*LMScore)
+    type: baseline
+    lambda1: 0.7
+    lambda2: 0.2
+    lambda3: 0.1
+    lm_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  # Optional S3 sync. Empty string disables uploading.
+  # Outputs land under {s3_output_uri}/{name}/{results,plots,model}.
+  s3_output_uri: ""
+  upload_model_to_s3: false
+
+training:
+  lr: 0.000002
+  accumulate_grad_batches: 1
+  epochs: 1
+  batch_size: 2
+  num_return_sequences: 4
+  updates_per_batch: 1
+  gen_temperature: 1.8
+  beta: 0.04
+  clip_param: 0.2
+  top_k: 100
+  top_p: 0.95
+  use_wandb: false
+  log_every_n_steps: 5
+  update_ref_policy_every_n_steps: 16
+
+eval:
+  run: true
+  only: false
+  translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
+  bertscore_lang: en
+  every_n_opt_steps: 50
+  num_beams: 1
+
+test:
+  run: true
+  translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
+  bertscore_lang: en
+  num_beams: 1
+
+constraints:
+  min_sentence_len: 1
+  max_sentence_len: 63

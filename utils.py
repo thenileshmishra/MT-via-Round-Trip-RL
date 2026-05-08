@@ -1,12 +1,81 @@
 import math
-from typing import Sequence
+from typing import Sequence, Optional
 
 import torch
-from sacrebleu.metrics import CHRF, BLEU
+from sacrebleu.metrics import CHRF, BLEU, TER
 
 # =========================
 # Distributed GRPO Utilities
 # =========================
+
+
+class LMScorer:
+    """Lightweight fluency reward via multilingual embedding similarity.
+
+    Used as the LMScore component of the modified reward:
+        R = lambda1 * chrF++ + lambda2 * BLEU + lambda3 * LMScore
+    Score = (cosine_similarity + 1) / 2, mapped to [0, 1].
+    """
+
+    def __init__(
+        self,
+        model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        device: Optional[str] = None,
+    ):
+        from sentence_transformers import SentenceTransformer
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.model = SentenceTransformer(model_name, device=device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def score(self, sources: Sequence[str], hypotheses: Sequence[str]):
+        src_emb = self.model.encode(
+            list(sources), convert_to_tensor=True, show_progress_bar=False
+        )
+        hyp_emb = self.model.encode(
+            list(hypotheses), convert_to_tensor=True, show_progress_bar=False
+        )
+        cos = torch.nn.functional.cosine_similarity(src_emb, hyp_emb)
+        return ((cos + 1.0) / 2.0).clamp(0.0, 1.0).cpu().tolist()
+
+
+def compute_translation_metrics(
+    predictions: Sequence[str],
+    references: Sequence[str],
+    bertscore_lang: str = "en",
+    compute_bertscore: bool = True,
+):
+    """Compute BLEU, chrF++, TER, BERTScore on a list of hyps/refs.
+
+    Returns a dict with keys: bleu, chrf++, ter, bertscore (all on a 0-100 scale).
+    """
+    predictions = list(predictions)
+    references = list(references)
+    bleu = BLEU().corpus_score(predictions, [references]).score
+    chrf = CHRF(word_order=2, char_order=6).corpus_score(predictions, [references]).score
+    ter_score = TER().corpus_score(predictions, [references]).score
+    metrics = {
+        "bleu": float(bleu),
+        "chrf++": float(chrf),
+        "ter": float(ter_score),
+    }
+    if compute_bertscore:
+        try:
+            from bert_score import score as bert_score_fn
+
+            _, _, f1 = bert_score_fn(
+                predictions, references, lang=bertscore_lang, verbose=False
+            )
+            metrics["bertscore"] = float(f1.mean().item()) * 100.0
+        except Exception as exc:  # pragma: no cover - optional dep
+            print(f"[warn] BERTScore failed ({exc}); reporting 0.0")
+            metrics["bertscore"] = 0.0
+    else:
+        metrics["bertscore"] = 0.0
+    return metrics
 
 @torch.no_grad()
 def grpo_generate_sequences(
@@ -105,6 +174,9 @@ def grpo_compute_loss_and_logs(
     beta: float,
     clip_param: float,
     tgt_lang_id: int,
+    reward_type: str = "baseline",
+    reward_lambdas: Sequence[float] = (0.7, 0.2, 0.1),
+    lm_scorer: Optional["LMScorer"] = None,
 ):
     if isinstance(ground_truths, str):
         ground_truths = [ground_truths]
@@ -175,9 +247,23 @@ def grpo_compute_loss_and_logs(
     bleu_scores_tensor = torch.tensor(bleu_scores, device=device)
     chrf_mean = chrf_scores_tensor.mean()
     bleu_mean = bleu_scores_tensor.mean()
-    # Combine chrF and BLEU equally for rewards
-    # combined_scores_tensor = 0.5 * chrf_scores_tensor + 0.5 * bleu_scores_tensor
-    combined_scores_tensor = chrf_scores_tensor
+
+    if reward_type == "modified":
+        # R = lambda1*chrF++ + lambda2*BLEU + lambda3*LMScore
+        if lm_scorer is None:
+            raise ValueError("reward_type='modified' requires an LMScorer instance.")
+        lm_scores = lm_scorer.score(references, generated_texts)
+        lm_scores_tensor = torch.tensor(lm_scores, device=device)
+        l1, l2, l3 = reward_lambdas
+        combined_scores_tensor = (
+            l1 * chrf_scores_tensor + l2 * bleu_scores_tensor + l3 * lm_scores_tensor
+        )
+        lm_mean = lm_scores_tensor.mean()
+    else:
+        # Original paper baseline reward: R = chrF++ + BLEU
+        combined_scores_tensor = chrf_scores_tensor + bleu_scores_tensor
+        lm_mean = torch.tensor(0.0, device=device)
+
     rewards = combined_scores_tensor.reshape(batch_size, num_candidates)
     standardized_rewards = (rewards - rewards.mean(dim=1, keepdim=True)) / (
         rewards.std(dim=1, keepdim=True) + 1e-4
@@ -214,5 +300,6 @@ def grpo_compute_loss_and_logs(
         "reward": rewards.mean().detach(),
         "chrf": chrf_mean.detach(),
         "bleu": bleu_mean.detach(),
+        "lmscore": lm_mean.detach(),
     }
     return loss, logs

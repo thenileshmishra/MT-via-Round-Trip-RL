@@ -1,48 +1,203 @@
-# Improving Low-Resource Machine Translation via Round-Trip Reinforcement Learning 
+# Improving Low-Resource Machine Translation via Round-Trip Reinforcement Learning
 
 ## Overview
 
-This repository contains the code for my MSc. thesis: "Improving Low-Resource Machine Translation via Round-Trip Reinforcement Learning". The paper is available [here](https://arxiv.org/abs/2601.12535).
+This repository contains the code for the MSc. thesis "Improving Low-Resource
+Machine Translation via Round-Trip Reinforcement Learning" together with the
+extension experiments for **Maithili (mai_Deva)** using NLLB-200-distilled-600M.
 
-Wandb Report Available [here](https://wandb.ai/ahmed-attia-mbzuai/grpo-translation-nllb-multi-domain/reports/MT-via-Round-Trip-RL-run-plots--VmlldzoxNjY1MjMwMg?accessToken=s8tssgnx0pwvzs96m9hd9tbf9z78odfixifcfo14xwv3bk9dh18opnz9erx37ndd).
-## Abstract 
-Low-resource machine translation (MT) has gained increasing attention as parallel data from low-resource language communities is collected, but many potential methods for improving low-resource MT remain unexplored. We investigate a self-supervised reinforcement-learning-based fine-tuning for translation in low-resource settings using round-trip bootstrapping with the No Language Left Behind (NLLB) family of models. Our approach translates English into a target low-resource language and then back into English, using a combination of chrF++ and BLEU as the reward function on the reconstructed English sentences. Using the NLLB-MD dataset, we evaluate both the 600M and 1.3B parameter NLLB models and observe consistent improvements for the following languages: Central Aymara, Friulian, Wolof and Russian. Qualitative inspection of translation outputs indicates increased fluency and semantic fidelity. We argue that our method can further benefit from scale, enabling models to increasingly leverage their pretrained knowledge and continue self-improving.
+The extension adds an extra fluency component (LMScore) to the round-trip
+reward, giving three experiment configurations:
 
+1. **baseline_eval** — vanilla pretrained NLLB-600M, evaluation only.
+2. **rl_baseline** — original paper reward `R = chrF++ + BLEU`.
+3. **modified_rl** — proposed reward `R = 0.7·chrF++ + 0.2·BLEU + 0.1·LMScore`.
 
-## Key Files
+LMScore is the cosine similarity between embeddings of the original English
+sentence and the back-translated English sentence, computed with
+`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` and mapped to
+`[0, 1]`.
 
-- `main.py`: Contains the main logic for loading the datasets, nllb models, training loop, evaluation, wandb logging, etc.
-- `dl.py`: Contains the data loading logic for the NLLB-MD dataset.
-- `utils.py`: Contains helpful utilities as well as the GRPO loss function.
-- `configs/`: Contains the configuration files for the training and evaluation.
-- `baselines/`: Contains the code for the backtranslation and UMNMT baselines used in the paper.
-- `requirements.txt`: Contains the dependencies for the project.
-
-## Usage
-Specify the dataset and model in the configuration file and run the training script:
+## Setup
 
 ```bash
-python main.py
+pip install -r requirements.txt
 ```
-Evaluation on the validation and test sets is done during and after training.
 
-## Baselines
-For running the baselines, you can directly run the bash scripts in the `baselines/` directory.
+A single GPU is sufficient for NLLB-600M.
+
+### Colab + AWS S3 setup
+
+The repo supports reading the dataset directly from S3 (`s3://...` paths via
+`s3fs`) and pushing all per-experiment outputs to S3 (`boto3`). On each Colab
+session run:
+
 ```bash
-bash baselines/backtranslation/run_backtranslation.sh
-bash baselines/UMNMT/run_training.sh
+git clone <REPO_URL> && cd MT-via-Round-Trip-RL
+pip install -q -r requirements.txt
 ```
+
+Then export AWS credentials in the notebook *before* `python main.py ...`:
+
+```python
+import os
+os.environ["AWS_ACCESS_KEY_ID"]     = "..."   # or read from Colab secrets
+os.environ["AWS_SECRET_ACCESS_KEY"] = "..."
+os.environ["AWS_DEFAULT_REGION"]    = "us-east-1"
+```
+
+Outputs land under `{s3_output_uri}/{experiment_name}/{results,plots,model}`,
+so three concurrent Colab sessions writing to distinct `experiment_name`s never
+collide on S3.
+
+## Dataset format
+
+The Maithili task expects English↔Maithili parallel data. Either
+
+- use a Hugging Face dataset (set `task.data.path` and
+  `task.data.dataset_config_name`), or
+- pass local CSV / TSV / JSONL files **or `s3://...` URIs** with the columns
+  `sentence_eng_Latn` and `sentence_mai_Deva` via:
+
+```bash
+task.data.train_file=s3://my-bucket/maithili/train.csv
+task.data.valid_file=s3://my-bucket/maithili/valid.csv
+task.data.test_file=s3://my-bucket/maithili/test.csv
+```
+
+Recommended sizes: train 5–15k, valid 500, test 500.
+
+## Training & evaluation commands
+
+All commands use the `nllb_maithili` task config. Override fields with the
+standard Hydra `key=value` syntax.
+
+Replace `S3_BUCKET` with your bucket and `S3_PREFIX` with a folder
+(e.g. `mt-rl/runs`). Each command is meant for one Colab session; the three
+can run concurrently because each writes to its own `name=` namespace.
+
+### 1. Baseline (no fine-tuning, evaluate only)
+
+```bash
+python main.py \
+    task=nllb_maithili \
+    task.experiment.mode=baseline_eval \
+    task.experiment.name=baseline_eval_maithili \
+    task.experiment.s3_output_uri=s3://S3_BUCKET/S3_PREFIX \
+    task.data.train_file=s3://S3_BUCKET/maithili/train.csv \
+    task.data.valid_file=s3://S3_BUCKET/maithili/valid.csv \
+    task.data.test_file=s3://S3_BUCKET/maithili/test.csv
+```
+
+### 2. RL baseline (chrF++ + BLEU reward)
+
+```bash
+python main.py \
+    task=nllb_maithili \
+    task.experiment.mode=rl_baseline \
+    task.experiment.name=rl_baseline_maithili \
+    task.experiment.s3_output_uri=s3://S3_BUCKET/S3_PREFIX \
+    task.experiment.upload_model_to_s3=true \
+    task.data.train_file=s3://S3_BUCKET/maithili/train.csv \
+    task.data.valid_file=s3://S3_BUCKET/maithili/valid.csv \
+    task.data.test_file=s3://S3_BUCKET/maithili/test.csv
+```
+
+### 3. Modified RL (chrF++ + BLEU + LMScore)
+
+```bash
+python main.py \
+    task=nllb_maithili \
+    task.experiment.mode=modified_rl \
+    task.experiment.name=modified_rl_maithili \
+    task.experiment.s3_output_uri=s3://S3_BUCKET/S3_PREFIX \
+    task.experiment.upload_model_to_s3=true \
+    task.data.train_file=s3://S3_BUCKET/maithili/train.csv \
+    task.data.valid_file=s3://S3_BUCKET/maithili/valid.csv \
+    task.data.test_file=s3://S3_BUCKET/maithili/test.csv
+```
+
+## Outputs
+
+Each run writes locally:
+
+- `results/{experiment_name}.json` — full metric history + final eval/test
+  numbers (BLEU, chrF++, TER, BERTScore).
+- `results/training_log_{experiment_name}.csv` — per-eval row
+  (`step, reward, bleu, chrf++, ter, bertscore`).
+- `results/summary.csv` — appended one row per run (local-only, paper-table
+  friendly; not synced to S3 to avoid races between concurrent runs).
+- `plots/{experiment_name}/` — `reward_vs_steps.png`, `chrf_vs_steps.png`,
+  `bleu_vs_steps.png`, `ter_vs_steps.png`, `bertscore_vs_steps.png`.
+
+When `task.experiment.s3_output_uri` is set, the same files are mirrored to
+`{s3_output_uri}/{experiment_name}/results/` and
+`{s3_output_uri}/{experiment_name}/plots/{experiment_name}/`. Model
+checkpoints are uploaded only when `task.experiment.upload_model_to_s3=true`.
+
+After all three runs finish, you can rebuild the consolidated paper table by
+downloading the three per-experiment JSONs:
+
+```bash
+mkdir -p results
+aws s3 cp s3://S3_BUCKET/S3_PREFIX/baseline_eval_maithili/results/baseline_eval_maithili.json results/
+aws s3 cp s3://S3_BUCKET/S3_PREFIX/rl_baseline_maithili/results/rl_baseline_maithili.json results/
+aws s3 cp s3://S3_BUCKET/S3_PREFIX/modified_rl_maithili/results/modified_rl_maithili.json results/
+```
+
+## Qualitative examples
+
+After running all three experiments, pull the two trained checkpoints down
+from S3 (the `baseline` model is just `facebook/nllb-200-distilled-600M`):
+
+```bash
+aws s3 cp --recursive \
+    s3://S3_BUCKET/S3_PREFIX/rl_baseline_maithili/model \
+    ./ckpts/rl_baseline_maithili
+aws s3 cp --recursive \
+    s3://S3_BUCKET/S3_PREFIX/modified_rl_maithili/model \
+    ./ckpts/modified_rl_maithili
+```
+
+Then generate side-by-side translations:
+
+```bash
+python generate_examples.py \
+    --baseline_model facebook/nllb-200-distilled-600M \
+    --rl_baseline_model ./ckpts/rl_baseline_maithili \
+    --modified_rl_model ./ckpts/modified_rl_maithili \
+    --test_file data/mai_test.csv \
+    --source_lang eng_Latn --target_lang mai_Deva \
+    --num_examples 20 \
+    --output qualitative_examples.csv
+```
+
+## Reproducibility
+
+`configs/train.yaml` sets `seed: 27`. The training script seeds Python,
+NumPy and PyTorch and toggles cuDNN to deterministic mode. Note that some
+CUDA kernels remain non-deterministic in mixed precision; results are
+expected to be reproducible to within a small tolerance.
+
+## Key files
+
+- `main.py` — training / evaluation loop, plot + metrics export.
+- `utils.py` — GRPO loss, `LMScorer`, `compute_translation_metrics`.
+- `dl.py` — dataset loading (HF dataset + local CSV/TSV/JSONL fallback).
+- `generate_examples.py` — qualitative outputs across the three modes.
+- `configs/task/nllb_maithili.yaml` — Maithili task config with experiment block.
+- `baselines/` — original UMNMT and back-translation baselines.
 
 ## Citation
-If you find this work useful, please cite:
+
 ```bibtex
 @misc{attia2026improvinglowresourcemachinetranslation,
-      title={Improving Low-Resource Machine Translation via Round-Trip Reinforcement Learning}, 
+      title={Improving Low-Resource Machine Translation via Round-Trip Reinforcement Learning},
       author={Ahmed Attia and Alham Fikri Aji},
       year={2026},
       eprint={2601.12535},
       archivePrefix={arXiv},
       primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2601.12535}, 
+      url={https://arxiv.org/abs/2601.12535},
 }
 ```
