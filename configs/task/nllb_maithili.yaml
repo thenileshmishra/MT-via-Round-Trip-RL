@@ -42,7 +42,7 @@ experiment:
 training:
   lr: 0.000002
   accumulate_grad_batches: 1
-  epochs: 1
+  epochs: 8
   batch_size: 2
   num_return_sequences: 4
   updates_per_batch: 1
@@ -60,7 +60,7 @@ eval:
   only: false
   translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
   bertscore_lang: en
-  every_n_opt_steps: 50
+  every_n_opt_steps: 100
   num_beams: 1
 
 test:
