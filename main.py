@@ -284,6 +284,19 @@ def train(config: DictConfig):
     else:
         force_eval_only = False  # unknown -> defer to eval.only flag
 
+    print("\n" + "=" * 65)
+    print(f"  Experiment  : {exp_name}")
+    print(f"  Mode        : {exp_mode}  ({'eval only' if force_eval_only else 'training + eval'})")
+    print(f"  Model       : {config.task.model.name}")
+    print(f"  Reward      : {reward_type}" + (
+        f"  (λ={reward_lambdas[0]:.1f}·chrF++ + {reward_lambdas[1]:.1f}·BLEU + {reward_lambdas[2]:.1f}·LMScore)"
+        if reward_type == "modified" else "  (chrF++ + BLEU)"
+    ))
+    print(f"  Source      : {config.task.data.source_lang}  →  Target: {config.task.data.target_lang}")
+    train_file_disp = getattr(config.task.data, "train_file", None) or config.task.data.path
+    print(f"  Train file  : {train_file_disp}")
+    print("=" * 65 + "\n")
+
     # Device mapping: policy (NLLB) on cuda:1, reference+goldfish on cuda:0
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         aux_device = torch.device("cuda:0")
@@ -392,6 +405,17 @@ def train(config: DictConfig):
     # Training hyperparameters
     max_epochs = int(config.task.training.epochs)
     updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 50))
+
+    # Print dataset and training configuration so the run is self-documenting.
+    _bs = int(getattr(config.task.training, "batch_size", 2))
+    _upb = updates_per_batch
+    _batches_per_epoch = len(data.train_data) // _bs + (1 if len(data.train_data) % _bs else 0)
+    print(f"[data]  train={len(data.train_data)}  valid={len(data.val_data)}"
+          + (f"  test={len(data.test_data)}" if data.test_data is not None else ""))
+    if run_training:
+        print(f"[train] epochs={max_epochs}  batch_size={_bs}  batches/epoch={_batches_per_epoch}")
+        print(f"[train] updates_per_batch={_upb}  num_return_sequences={int(getattr(config.task.training, 'num_return_sequences', 4))}")
+        print(f"[train] total optimizer steps ≈ {_batches_per_epoch * _upb * max_epochs}")
     grad_accum_steps = int(getattr(config.task.training, "accumulate_grad_batches", 1))
     if grad_accum_steps < 1:
         raise ValueError("accumulate_grad_batches must be >= 1.")
