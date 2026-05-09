@@ -861,7 +861,8 @@ def get_model(config: DictConfig):
         model_cfg.name,
     )
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_cfg.name
+        model_cfg.name,
+        torch_dtype=torch.bfloat16,
     )
 
     use_lora = bool(getattr(model_cfg, "use_lora", False))

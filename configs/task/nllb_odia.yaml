@@ -35,9 +35,9 @@ experiment:
 training:
   lr: 0.000002
   accumulate_grad_batches: 1
-  epochs: 3
+  epochs: 11
   max_steps: 8000
-  batch_size: 2
+  batch_size: 8
   num_return_sequences: 4
   updates_per_batch: 1
   gen_temperature: 1.8
