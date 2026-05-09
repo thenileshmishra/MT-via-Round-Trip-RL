@@ -1,13 +1,10 @@
-name: "nllb-maithili"
+name: "nllb-assamese"
 
 data:
   path: "breakend/nllb-multi-domain"
   source_lang: eng_Latn
-  target_lang: mai_Deva
-  dataset_config_name: "eng_Latn-mai_Deva"
-  # Set these to point to local CSV/TSV/JSONL files with columns
-  # `sentence_eng_Latn` and `sentence_mai_Deva`. Leaving them null
-  # falls back to the HF dataset specified above.
+  target_lang: asm_Beng
+  dataset_config_name: "eng_Latn-asm_Beng"
   train_file: null
   valid_file: null
   test_file: null
@@ -26,7 +23,7 @@ model:
 experiment:
   # mode: baseline_eval | rl_baseline | modified_rl
   mode: rl_baseline
-  name: rl_baseline_maithili
+  name: rl_baseline_assamese
   reward:
     # type: baseline (chrF++ + BLEU) | modified (lambda1*chrF++ + lambda2*BLEU + lambda3*LMScore)
     type: baseline
@@ -34,8 +31,6 @@ experiment:
     lambda2: 0.2
     lambda3: 0.1
     lm_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-  # Optional S3 sync. Empty string disables uploading.
-  # Outputs land under {s3_output_uri}/{name}/{results,plots,model}.
   s3_output_uri: ""
   upload_model_to_s3: false
 
@@ -60,14 +55,14 @@ eval:
   run: true
   only: false
   translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
-  bertscore_lang: en
+  bertscore_lang: bn
   every_n_opt_steps: 500
   num_beams: 1
 
 test:
   run: true
   translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
-  bertscore_lang: en
+  bertscore_lang: bn
   num_beams: 1
 
 constraints:

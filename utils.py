@@ -1,5 +1,5 @@
 import math
-from typing import Sequence, Optional
+from typing import Sequence, Optional, List
 
 import torch
 from sacrebleu.metrics import CHRF, BLEU, TER
@@ -42,6 +42,54 @@ class LMScorer:
         return ((cos + 1.0) / 2.0).clamp(0.0, 1.0).cpu().tolist()
 
 
+class GoldfishScorer:
+    """Log-probability scoring via Goldfish KenLM models (Magnusson et al., 2023).
+
+    Provides Table-2 fluency metric: average natural-log-probability per word.
+    Falls back gracefully if kenlm or the model file is unavailable.
+
+    NLLB lang code → ISO 639-3 used by Goldfish:
+      mai_Deva → mai,  bho_Deva → bho,  asm_Beng → asm
+    """
+
+    _NLLB_TO_GOLDFISH = {
+        "mai_Deva": "mai",
+        "bho_Deva": "bho",
+        "asm_Beng": "asm",
+    }
+
+    def __init__(self, nllb_lang_code: str):
+        self.available = False
+        self._model = None
+        try:
+            import kenlm
+            from huggingface_hub import hf_hub_download
+
+            lang = self._NLLB_TO_GOLDFISH.get(
+                nllb_lang_code, nllb_lang_code.split("_")[0].lower()
+            )
+            model_path = hf_hub_download(
+                repo_id="cis-lmu/Goldfish",
+                filename=f"{lang}/{lang}.binary",
+            )
+            self._model = kenlm.Model(model_path)
+            self.available = True
+            print(f"[GoldfishScorer] Loaded KenLM model for '{lang}'")
+        except Exception as exc:
+            print(f"[GoldfishScorer] Unavailable for '{nllb_lang_code}': {exc}")
+
+    def score(self, texts: List[str]) -> List[float]:
+        """Return average natural-log-probability per word for each text."""
+        if not self.available:
+            return [float("nan")] * len(texts)
+        scores = []
+        for text in texts:
+            words = max(len(text.split()), 1)
+            log10_total = self._model.score(text, bos=True, eos=True)
+            scores.append(log10_total * math.log(10) / words)
+        return scores
+
+
 def compute_translation_metrics(
     predictions: Sequence[str],
     references: Sequence[str],
@@ -50,7 +98,8 @@ def compute_translation_metrics(
 ):
     """Compute BLEU, chrF++, TER, BERTScore on a list of hyps/refs.
 
-    Returns a dict with keys: bleu, chrf++, ter, bertscore (all on a 0-100 scale).
+    Returns a dict with keys: bleu, chrf++, ter, bertscore, bertscore_p, bertscore_r
+    (all on a 0-100 scale).
     """
     predictions = list(predictions)
     references = list(references)
@@ -66,14 +115,20 @@ def compute_translation_metrics(
         try:
             from bert_score import score as bert_score_fn
 
-            _, _, f1 = bert_score_fn(
+            P, R, F1 = bert_score_fn(
                 predictions, references, lang=bertscore_lang, verbose=False
             )
-            metrics["bertscore"] = float(f1.mean().item()) * 100.0
+            metrics["bertscore_p"] = float(P.mean().item()) * 100.0
+            metrics["bertscore_r"] = float(R.mean().item()) * 100.0
+            metrics["bertscore"] = float(F1.mean().item()) * 100.0
         except Exception as exc:  # pragma: no cover - optional dep
             print(f"[warn] BERTScore failed ({exc}); reporting 0.0")
+            metrics["bertscore_p"] = 0.0
+            metrics["bertscore_r"] = 0.0
             metrics["bertscore"] = 0.0
     else:
+        metrics["bertscore_p"] = 0.0
+        metrics["bertscore_r"] = 0.0
         metrics["bertscore"] = 0.0
     return metrics
 

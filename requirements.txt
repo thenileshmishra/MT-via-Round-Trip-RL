@@ -20,3 +20,4 @@ sacrebleu
 bert-score
 boto3
 s3fs
+kenlm

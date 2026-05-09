@@ -2,6 +2,7 @@ import os
 import csv
 import json
 import copy
+import math
 import random
 import hydra
 import numpy as np
@@ -24,6 +25,7 @@ from utils import (
     grpo_compute_loss_and_logs,
     compute_translation_metrics,
     LMScorer,
+    GoldfishScorer,
 )
 from dl import TranslationDataModule
 
@@ -404,6 +406,7 @@ def train(config: DictConfig):
     total_training_steps = int(getattr(config.task.training, "epochs", 1)) * len(data.train_dataloader())
     # Training hyperparameters
     max_epochs = int(config.task.training.epochs)
+    max_steps = int(getattr(config.task.training, "max_steps", 0))  # 0 = no limit
     updates_per_batch = int(getattr(config.task.training, "updates_per_batch", 50))
 
     # Print dataset and training configuration so the run is self-documenting.
@@ -496,6 +499,14 @@ def train(config: DictConfig):
                 fieldnames=["step", "reward", "bleu", "chrf++", "ter", "bertscore"],
             )
         return out
+
+    # Load Goldfish scorer for Table 2 (log-prob fluency before/after training)
+    goldfish_scorer = None
+    if run_test:
+        try:
+            goldfish_scorer = GoldfishScorer(target_lang_code)
+        except Exception as _gf_exc:
+            print(f"[warn] GoldfishScorer init failed: {_gf_exc}")
 
     test_initial_out = None
     eval_initial_out = None
@@ -674,21 +685,18 @@ def train(config: DictConfig):
                             "train/backward_lmscore": float(logs_backward["lmscore"].item()),
                         }
                     )
-                    # if train_table is not None:
-                    #     for reference, decoded, ref_sample_id in best_candidates:
-                    #         train_table.add_data(
-                    #             reference,
-                    #             decoded,
-                    #             ref_sample_id,
-                    #         )
-                    #     wandb.log({"train/Translations": train_table}, step=step_idx)
                 step_idx += 1
+                if max_steps > 0 and optimizer_step >= max_steps:
+                    print(f"[train] Reached max_steps={max_steps}. Stopping training.")
+                    break
             # Save the model every epoch
             epoch_save_dir = os.path.join(os.getcwd(), "model", f"{model_name_for_run}_epoch_{epoch}_{target_lang_code}_chrf")
             os.makedirs(epoch_save_dir, exist_ok=True)
             model.save_pretrained(epoch_save_dir)
             tokenizer.save_pretrained(epoch_save_dir)
             print(f"Model saved to {epoch_save_dir}")
+            if max_steps > 0 and optimizer_step >= max_steps:
+                break
     final_eval_out = None
     final_test_out = None
     final_step = int(locals().get("optimizer_step", 0))
@@ -699,6 +707,83 @@ def train(config: DictConfig):
 
     if run_test:
         final_test_out = _evaluate_and_log("test", test_dataloader, test_eval_cfg, final_step)
+
+    # ── Table 2: Goldfish log-probability scores ──────────────────────────────
+    # Compute average natural-log-prob/word on vanilla and trained translations.
+    goldfish_summary = {}
+    if goldfish_scorer and goldfish_scorer.available:
+        def _gf_mean(out):
+            if out is None:
+                return None
+            preds = out.get("predictions", [])
+            if not preds:
+                return None
+            sc = [s for s in goldfish_scorer.score(preds) if not math.isnan(s)]
+            return sum(sc) / max(len(sc), 1) if sc else None
+
+        vanilla_lnp = _gf_mean(test_initial_out)
+        trained_lnp = _gf_mean(final_test_out)
+        goldfish_summary = {
+            "vanilla_lnp_per_word": vanilla_lnp,
+            "trained_lnp_per_word": trained_lnp,
+            "delta": (trained_lnp - vanilla_lnp)
+            if (vanilla_lnp is not None and trained_lnp is not None)
+            else None,
+        }
+        if goldfish_summary.get("delta") is not None:
+            print(
+                f"[Table 2] Goldfish lnp/word: vanilla={vanilla_lnp:.4f}  "
+                f"trained={trained_lnp:.4f}  Δ={goldfish_summary['delta']:+.4f}"
+            )
+
+    # ── Table 3: Back-translation BERTScore P/R/F1 ───────────────────────────
+    # Forward translate English → Target, back-translate Target → English,
+    # then compute BERTScore between original English and back-translated English.
+    back_bt_scores = {}
+    eval_out_for_bt = final_test_out if final_test_out else test_initial_out
+    if eval_out_for_bt and eval_out_for_bt.get("predictions"):
+        test_preds_bt = eval_out_for_bt["predictions"]
+        test_sources_bt = eval_out_for_bt.get("sources", [])
+        if test_sources_bt and len(test_sources_bt) == len(test_preds_bt):
+            try:
+                print(f"Computing back-translation BERTScore on {len(test_preds_bt)} sentences (Table 3)...")
+                model.eval()
+                back_translations = []
+                _bt_batch = 8
+                with torch.no_grad():
+                    for _i in tqdm(range(0, len(test_preds_bt), _bt_batch), desc="Back-translating"):
+                        _batch_preds = test_preds_bt[_i: _i + _bt_batch]
+                        _enc = _tokenize_with_lang(_batch_preds, target_lang_code)
+                        _enc = {k: v.to(policy_device) for k, v in _enc.items()}
+                        _gen = model.generate(
+                            input_ids=_enc["input_ids"],
+                            attention_mask=_enc.get("attention_mask"),
+                            forced_bos_token_id=src_lang_id,
+                            max_new_tokens=max_new_tokens,
+                            num_beams=1,
+                            do_sample=False,
+                            pad_token_id=tokenizer.pad_token_id,
+                            eos_token_id=tokenizer.eos_token_id,
+                        )
+                        for _j in range(_gen.size(0)):
+                            back_translations.append(
+                                tokenizer.decode(_gen[_j], skip_special_tokens=True)
+                            )
+                from bert_score import score as _bt_bert_score
+                _P, _R, _F1 = _bt_bert_score(
+                    back_translations, test_sources_bt, lang="en", verbose=False
+                )
+                back_bt_scores = {
+                    "precision": float(_P.mean()) * 100,
+                    "recall": float(_R.mean()) * 100,
+                    "f1": float(_F1.mean()) * 100,
+                }
+                print(
+                    f"[Table 3] Back-BERTScore: P={back_bt_scores['precision']:.2f}  "
+                    f"R={back_bt_scores['recall']:.2f}  F1={back_bt_scores['f1']:.2f}"
+                )
+            except Exception as _bt_exc:
+                print(f"[warn] Back-translation BERTScore failed: {_bt_exc}")
 
     # Save plots and JSON summary
     _save_run_plots(metric_history, plots_dir)
@@ -715,6 +800,8 @@ def train(config: DictConfig):
         "history": metric_history,
         "final_eval": (final_eval_out or eval_initial_out or {}).get("metrics") if (final_eval_out or eval_initial_out) else None,
         "final_test": (final_test_out or test_initial_out or {}).get("metrics") if (final_test_out or test_initial_out) else None,
+        "goldfish_scores": goldfish_summary,
+        "back_translation_bertscore": back_bt_scores,
     }
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -729,13 +816,24 @@ def train(config: DictConfig):
     }
     for split_key, payload in (("eval", summary["final_eval"]), ("test", summary["final_test"])):
         if payload:
-            for m in ("bleu", "chrf++", "ter", "bertscore"):
+            for m in ("bleu", "chrf++", "ter", "bertscore", "bertscore_p", "bertscore_r"):
                 csv_row[f"{split_key}_{m}"] = float(payload.get(m, 0.0))
-    fieldnames = ["experiment", "mode", "reward_type"] + [
-        f"{split}_{m}"
-        for split in ("eval", "test")
-        for m in ("bleu", "chrf++", "ter", "bertscore")
-    ]
+    if goldfish_summary.get("vanilla_lnp_per_word") is not None:
+        csv_row["goldfish_vanilla_lnp"] = goldfish_summary["vanilla_lnp_per_word"]
+    if goldfish_summary.get("trained_lnp_per_word") is not None:
+        csv_row["goldfish_trained_lnp"] = goldfish_summary["trained_lnp_per_word"]
+    if goldfish_summary.get("delta") is not None:
+        csv_row["goldfish_delta"] = goldfish_summary["delta"]
+    if back_bt_scores:
+        csv_row["back_bt_bertscore_p"] = back_bt_scores.get("precision", 0.0)
+        csv_row["back_bt_bertscore_r"] = back_bt_scores.get("recall", 0.0)
+        csv_row["back_bt_bertscore_f1"] = back_bt_scores.get("f1", 0.0)
+    fieldnames = (
+        ["experiment", "mode", "reward_type"]
+        + [f"{split}_{m}" for split in ("eval", "test") for m in ("bleu", "chrf++", "ter", "bertscore", "bertscore_p", "bertscore_r")]
+        + ["goldfish_vanilla_lnp", "goldfish_trained_lnp", "goldfish_delta"]
+        + ["back_bt_bertscore_p", "back_bt_bertscore_r", "back_bt_bertscore_f1"]
+    )
     _append_csv_row(csv_summary_path, csv_row, fieldnames=fieldnames)
     print(f"Appended CSV summary row to {csv_summary_path}")
 
