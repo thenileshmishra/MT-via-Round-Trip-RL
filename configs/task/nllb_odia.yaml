@@ -1,13 +1,10 @@
-name: "nllb-maithili"
+name: "nllb-odia"
 
 data:
-  path: "breakend/nllb-multi-domain"
+  path: "ai4bharat/samanantar"
   source_lang: eng_Latn
-  target_lang: mai_Deva
-  dataset_config_name: "eng_Latn-mai_Deva"
-  # Set these to point to local CSV/TSV/JSONL files with columns
-  # `sentence_eng_Latn` and `sentence_mai_Deva`. Leaving them null
-  # falls back to the HF dataset specified above.
+  target_lang: ory_Orya
+  dataset_config_name: "or"
   train_file: null
   valid_file: null
   test_file: null
@@ -24,18 +21,14 @@ model:
       - v_proj
 
 experiment:
-  # mode: baseline_eval | rl_baseline | modified_rl
   mode: rl_baseline
-  name: rl_baseline_maithili
+  name: rl_baseline_odia
   reward:
-    # type: baseline (chrF++ + BLEU) | modified (lambda1*chrF++ + lambda2*BLEU + lambda3*LMScore)
     type: baseline
     lambda1: 0.7
     lambda2: 0.2
     lambda3: 0.1
     lm_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-  # Optional S3 sync. Empty string disables uploading.
-  # Outputs land under {s3_output_uri}/{name}/{results,plots,model}.
   s3_output_uri: ""
   upload_model_to_s3: false
 
@@ -60,14 +53,14 @@ eval:
   run: true
   only: false
   translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
-  bertscore_lang: en
+  bertscore_lang: or
   every_n_opt_steps: 500
   num_beams: 1
 
 test:
   run: true
   translation_metric: ["bleu", "chrf++", "ter", "bertscore"]
-  bertscore_lang: en
+  bertscore_lang: or
   num_beams: 1
 
 constraints:
